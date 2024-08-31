@@ -31,28 +31,33 @@ class MoELayer(nn.Module):
             self.expert_biases = nn.Parameter(torch.zeros(num_experts))
 
     def forward(self, x):
-        if self.use_aux_loss:
-            gate_logits = self.gate(x)
+        # s_{i,t}
+        gate_output = self.gate(x)
+        # use sigmoid gate instead of softmax
+        gate_probs = torch.sigmoid(gate_output)
+
+        # do top k based on s_{i,t} + b_i
+        if not self.use_aux_loss:
+            gate_logits = gate_output + self.expert_biases
         else:
-            gate_logits = self.gate(x) + self.expert_biases
-        
-        gate_probs = torch.sigmoid(gate_logits)
-        
-        top_k_probs, top_k_indices = torch.topk(gate_probs, self.k, dim=-1)
+            gate_logits = gate_output
+        _, top_k_indices = torch.topk(gate_logits, self.k, dim=-1)
+
+        # ...but make sure we use the unbiased s_{i,t} as the gate value
+        top_k_probs = gate_probs.gather(-1, top_k_indices)
+
+        # normalize to sum to 1
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
-        expert_outputs = torch.stack([expert(x) for expert in self.experts])
-        
+        # get the routed expert outputs
         batch_size, seq_len, _ = x.shape
+        expert_outputs = torch.stack([expert(x) for expert in self.experts])
         indices = top_k_indices.unsqueeze(-1).expand(-1, -1, -1, self.output_size)
         expert_outputs = expert_outputs.gather(0, indices.permute(3, 0, 1, 2)).permute(1, 2, 3, 0)
         
         final_output = (expert_outputs * top_k_probs.unsqueeze(-1)).sum(dim=-2)
-        
-        if self.use_aux_loss:
-            return final_output, gate_probs
-        else:
-            return final_output, top_k_indices
+
+        return final_output, gate_probs, top_k_indices
 
 class ToyMoEModel(nn.Module):
     def __init__(self, vocab_size, embed_size, hidden_size, num_experts, k, use_aux_loss=False):
@@ -64,9 +69,9 @@ class ToyMoEModel(nn.Module):
 
     def forward(self, x):
         x = self.embedding(x)
-        x, gate_output = self.moe_layer(x)
+        x, gate_output, topk_idx = self.moe_layer(x)
         x = self.output_layer(x)
-        return x, gate_output
+        return x, gate_output, topk_idx
 
 class TextDataset(Dataset):
     def __init__(self, encoded_texts, max_length):
@@ -96,6 +101,7 @@ def load_and_preprocess_data(max_length=128):
     
     return train_dataset, tokenizer
 
+# This metric is pretty simple
 def calculate_maxvio(expert_counts):
     avg_count = expert_counts.float().mean()
     max_violation = torch.max(torch.abs(expert_counts.float() - avg_count) / avg_count)
@@ -126,7 +132,7 @@ def calculate_auxiliary_loss(gate_probs):
     aux_loss = torch.sum(f_i * P_i)
     return aux_loss
 
-def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, batch_size=32, learning_rate=1e-3, update_rate=1e-5, aux_loss_coeff=0.01):
+def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, batch_size=32, learning_rate=1e-3, update_rate=1e-4, aux_loss_coeff=0.01):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
@@ -149,7 +155,7 @@ def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, bat
             
             optimizer.zero_grad()
             
-            outputs, gate_output = model(input_ids)
+            outputs, gate_output, topk_idx = model(input_ids)
             
             shift_logits = outputs[..., :-1, :].contiguous()
             shift_labels = input_ids[..., 1:].contiguous()
@@ -167,24 +173,24 @@ def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, bat
             
             total_loss += loss.item()
             losses.append(loss.item())
-            
-            if use_aux_loss:
-                batch_expert_counts = gate_output.sum(dim=[0, 1])
-            else:
-                batch_expert_counts = torch.bincount(gate_output.flatten(), minlength=model.moe_layer.num_experts)
-            
-            expert_counts += batch_expert_counts
-            
-            maxvio = calculate_maxvio(batch_expert_counts)
+
+            # use gate probability output to calculate maxvio
+            expert_probs_sum = gate_output.sum(dim=[0,1])
+            maxvio = calculate_maxvio(expert_probs_sum)
             maxvios.append(maxvio)
-            
+
+            # use token assignment count to adjust biases for experts
             if not use_aux_loss:
+                batch_expert_counts = torch.bincount(topk_idx.flatten(),
+                                                     minlength=model.moe_layer.num_experts)
+                expert_counts += batch_expert_counts
                 avg_count = expert_counts.float().mean()
                 for i, count in enumerate(expert_counts):
+                    # b_i = b_i + u + sign(e_i)
                     error = count.float() - avg_count
                     model.moe_layer.expert_biases.data[i] += update_rate * torch.sign(error)
             
-            expert_counts.zero_()
+                expert_counts.zero_()
         
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
