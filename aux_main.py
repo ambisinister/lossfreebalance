@@ -16,57 +16,49 @@ class ExpertLayer(nn.Module):
         return self.fc(x)
 
 class MoELayer(nn.Module):
-    def __init__(self, input_size, output_size, num_experts, k, use_aux_loss=False):
+    def __init__(self, input_size, output_size, num_experts, k):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.num_experts = num_experts
         self.k = k
-        self.use_aux_loss = use_aux_loss
 
         self.experts = nn.ModuleList([ExpertLayer(input_size, output_size) for _ in range(num_experts)])
         self.gate = nn.Linear(input_size, num_experts)
-        
-        if not use_aux_loss:
-            self.expert_biases = nn.Parameter(torch.zeros(num_experts))
 
     def forward(self, x):
-        if self.use_aux_loss:
-            gate_logits = self.gate(x)
-        else:
-            gate_logits = self.gate(x) + self.expert_biases
-        
+        # Gate computation
+        gate_logits = self.gate(x)
         gate_probs = torch.sigmoid(gate_logits)
         
+        # Top-k gating
         top_k_probs, top_k_indices = torch.topk(gate_probs, self.k, dim=-1)
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
+        # Compute expert outputs
         expert_outputs = torch.stack([expert(x) for expert in self.experts])
         
+        # Gather and combine expert outputs
         batch_size, seq_len, _ = x.shape
         indices = top_k_indices.unsqueeze(-1).expand(-1, -1, -1, self.output_size)
         expert_outputs = expert_outputs.gather(0, indices.permute(3, 0, 1, 2)).permute(1, 2, 3, 0)
         
         final_output = (expert_outputs * top_k_probs.unsqueeze(-1)).sum(dim=-2)
         
-        if self.use_aux_loss:
-            return final_output, gate_probs
-        else:
-            return final_output, top_k_indices
+        return final_output, gate_probs
 
 class ToyMoEModel(nn.Module):
-    def __init__(self, vocab_size, embed_size, hidden_size, num_experts, k, use_aux_loss=False):
+    def __init__(self, vocab_size, embed_size, hidden_size, num_experts, k):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.moe_layer = MoELayer(embed_size, hidden_size, num_experts, k, use_aux_loss)
+        self.moe_layer = MoELayer(embed_size, hidden_size, num_experts, k)
         self.output_layer = nn.Linear(hidden_size, vocab_size)
-        self.use_aux_loss = use_aux_loss
 
     def forward(self, x):
         x = self.embedding(x)
-        x, gate_output = self.moe_layer(x)
+        x, gate_probs = self.moe_layer(x)
         x = self.output_layer(x)
-        return x, gate_output
+        return x, gate_probs
 
 class TextDataset(Dataset):
     def __init__(self, encoded_texts, max_length):
@@ -101,7 +93,7 @@ def calculate_maxvio(expert_counts):
     max_violation = torch.max(torch.abs(expert_counts.float() - avg_count) / avg_count)
     return max_violation.item()
 
-def plot_metrics(losses, maxvios, use_aux_loss):
+def plot_metrics(losses, maxvios):
     plt.figure(figsize=(12, 5))
     
     plt.subplot(1, 2, 1)
@@ -117,16 +109,10 @@ def plot_metrics(losses, maxvios, use_aux_loss):
     plt.ylabel('MaxVio')
     
     plt.tight_layout()
-    plt.savefig(f'training_metrics_{"aux_loss" if use_aux_loss else "original"}.png')
+    plt.savefig('training_metrics_auxiliary_loss.png')
     plt.close()
 
-def calculate_auxiliary_loss(gate_probs):
-    f_i = gate_probs.sum(dim=[0, 1]) / (gate_probs.size(0) * gate_probs.size(1))
-    P_i = gate_probs.mean(dim=[0, 1])
-    aux_loss = torch.sum(f_i * P_i)
-    return aux_loss
-
-def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, batch_size=32, learning_rate=1e-3, update_rate=1e-3, aux_loss_coeff=0.01):
+def train(model, train_dataset, tokenizer, num_epochs=1, batch_size=32, learning_rate=1e-3, aux_loss_coeff=0.01):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
@@ -141,7 +127,6 @@ def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, bat
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
-        expert_counts = torch.zeros(model.moe_layer.num_experts).to(device)
         
         for batch in tqdm(train_loader):
             input_ids = batch["input_ids"].to(device)
@@ -149,18 +134,20 @@ def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, bat
             
             optimizer.zero_grad()
             
-            outputs, gate_output = model(input_ids)
+            outputs, gate_probs = model(input_ids)
             
+            # Shift the targets for next token prediction
             shift_logits = outputs[..., :-1, :].contiguous()
             shift_labels = input_ids[..., 1:].contiguous()
             
+            # Main loss
             main_loss = criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             
-            if use_aux_loss:
-                aux_loss = aux_loss_coeff * calculate_auxiliary_loss(gate_output)
-                loss = main_loss + aux_loss
-            else:
-                loss = main_loss
+            # Auxiliary loss for load balancing
+            aux_loss = aux_loss_coeff * calculate_auxiliary_loss(gate_probs)
+            
+            # Total loss
+            loss = main_loss + aux_loss
             
             loss.backward()
             optimizer.step()
@@ -168,30 +155,30 @@ def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, bat
             total_loss += loss.item()
             losses.append(loss.item())
             
-            if use_aux_loss:
-                batch_expert_counts = gate_output.sum(dim=[0, 1])
-            else:
-                batch_expert_counts = torch.bincount(gate_output.flatten(), minlength=model.moe_layer.num_experts)
-            
-            expert_counts += batch_expert_counts
-            
-            maxvio = calculate_maxvio(batch_expert_counts)
+            # Calculate and store MaxVio
+            expert_counts = gate_probs.sum(dim=[0, 1])
+            maxvio = calculate_maxvio(expert_counts)
             maxvios.append(maxvio)
-            
-            if not use_aux_loss:
-                avg_count = expert_counts.float().mean()
-                for i, count in enumerate(expert_counts):
-                    error = count.float() - avg_count
-                    model.moe_layer.expert_biases.data[i] += update_rate * torch.sign(error)
-            
-            expert_counts.zero_()
         
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
     
-    plot_metrics(losses, maxvios, use_aux_loss)
+    # Plot metrics after training
+    plot_metrics(losses, maxvios)
 
-def main(use_aux_loss=False):
+def calculate_auxiliary_loss(gate_probs):
+    # Compute the fraction of tokens routed to each expert
+    f_i = gate_probs.sum(dim=[0, 1]) / (gate_probs.size(0) * gate_probs.size(1))
+    
+    # Compute the average gating probability for each expert
+    P_i = gate_probs.mean(dim=[0, 1])
+    
+    # Compute the auxiliary loss
+    aux_loss = torch.sum(f_i * P_i)
+    
+    return aux_loss
+
+def main():
     vocab_size = 30522  # BERT vocab size
     embed_size = 256
     hidden_size = 512
@@ -200,9 +187,9 @@ def main(use_aux_loss=False):
 
     train_dataset, tokenizer = load_and_preprocess_data()
     
-    model = ToyMoEModel(vocab_size, embed_size, hidden_size, num_experts, k, use_aux_loss)
+    model = ToyMoEModel(vocab_size, embed_size, hidden_size, num_experts, k)
     
-    train(model, train_dataset, tokenizer, use_aux_loss=use_aux_loss)
+    train(model, train_dataset, tokenizer)
 
 if __name__ == "__main__":
-    main(use_aux_loss=False)
+    main()
