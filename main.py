@@ -126,7 +126,7 @@ def calculate_auxiliary_loss(gate_probs):
     aux_loss = torch.sum(f_i * P_i)
     return aux_loss
 
-def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, batch_size=32, learning_rate=1e-3, update_rate=1e-3, aux_loss_coeff=0.01):
+def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, batch_size=32, learning_rate=1e-3, update_rate=1e-5, aux_loss_coeff=0.01):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
