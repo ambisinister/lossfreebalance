@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,6 +42,7 @@ class MoELayer(nn.Module):
             gate_logits = gate_output + self.expert_biases
         else:
             gate_logits = gate_output
+            
         _, top_k_indices = torch.topk(gate_logits, self.k, dim=-1)
 
         # ...but make sure we use the unbiased s_{i,t} as the gate value
@@ -101,26 +103,41 @@ def load_and_preprocess_data(max_length=128):
     
     return train_dataset, tokenizer
 
-# This metric is pretty simple
+# placeholder for visibility
 def calculate_maxvio(expert_counts):
     avg_count = expert_counts.float().mean()
-    max_violation = torch.max(torch.abs(expert_counts.float() - avg_count) / avg_count)
-    return max_violation.item()
+    #max_violation = torch.max(torch.abs(expert_counts.float() - avg_count) / avg_count)
+
+    min_violation = torch.min(expert_counts.float()) / avg_count 
+    max_violation = torch.max(expert_counts.float()) / avg_count 
+    return [min_violation.item(), max_violation.item()]
 
 def plot_metrics(losses, maxvios, use_aux_loss):
-    plt.figure(figsize=(12, 5))
+    plt.figure(figsize=(18, 5))
     
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, 3, 1)
     plt.plot(losses)
     plt.title('Training Loss')
     plt.xlabel('Step')
     plt.ylabel('Loss')
+
+    mins = [x[0] for x in maxvios]
+    maxes = [x[1] for x in maxvios]
+    window_size = 50
     
-    plt.subplot(1, 2, 2)
-    plt.plot(maxvios)
-    plt.title('MaxVio')
+    plt.subplot(1, 3, 2)
+    moving_avg = np.convolve(mins, np.ones(window_size)/window_size, mode='valid')
+    plt.plot(range(window_size-1, len(maxvios)), moving_avg)
+    plt.title('Tokens used by least-used expert (moving avg)')
     plt.xlabel('Step')
-    plt.ylabel('MaxVio')
+    plt.ylabel('Proportion of Average (1.0 is perfect balance)')
+
+    plt.subplot(1, 3, 3)
+    moving_avg = np.convolve(maxes, np.ones(window_size)/window_size, mode='valid')
+    plt.plot(range(window_size-1, len(maxvios)), moving_avg)
+    plt.title('Tokens used by most-used expert (moving avg)')
+    plt.xlabel('Step')
+    plt.ylabel('Proportion of Average (1.0 is perfect balance)')
     
     plt.tight_layout()
     plt.savefig(f'training_metrics_{"aux_loss" if use_aux_loss else "original"}.png')
@@ -132,7 +149,7 @@ def calculate_auxiliary_loss(gate_probs):
     aux_loss = torch.sum(f_i * P_i)
     return aux_loss
 
-def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, batch_size=32, learning_rate=1e-3, update_rate=1e-4, aux_loss_coeff=0.01):
+def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, batch_size=32, learning_rate=1e-3, update_rate=1e-5, aux_loss_coeff=0.01):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
@@ -147,7 +164,6 @@ def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, bat
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
-        expert_counts = torch.zeros(model.moe_layer.num_experts).to(device)
         
         for batch in tqdm(train_loader):
             input_ids = batch["input_ids"].to(device)
@@ -174,23 +190,22 @@ def train(model, train_dataset, tokenizer, use_aux_loss=False, num_epochs=1, bat
             total_loss += loss.item()
             losses.append(loss.item())
 
-            # use gate probability output to calculate maxvio
-            expert_probs_sum = gate_output.sum(dim=[0,1])
-            maxvio = calculate_maxvio(expert_probs_sum)
+            # maxvio to quantify distance from ideal load
+            expert_counts = torch.bincount(topk_idx.flatten(),
+                                           minlength=model.moe_layer.num_experts)            
+            maxvio = calculate_maxvio(expert_counts)
             maxvios.append(maxvio)
+            print(np.mean([x[0] for x in maxvios]), np.mean([x[1] for x in maxvios]))
 
-            # use token assignment count to adjust biases for experts
+            # adjust biases for experts
             if not use_aux_loss:
-                batch_expert_counts = torch.bincount(topk_idx.flatten(),
-                                                     minlength=model.moe_layer.num_experts)
-                expert_counts += batch_expert_counts
                 avg_count = expert_counts.float().mean()
                 for i, count in enumerate(expert_counts):
                     # b_i = b_i + u + sign(e_i)
-                    error = count.float() - avg_count
+                    # note: this is \bar{c_i} - c_i, NOT c_i - \bar{c_i}, which will push the network to
+                    # be maximally unbalanced. Really important to get this part right!!!
+                    error = avg_count - count.float()
                     model.moe_layer.expert_biases.data[i] += update_rate * torch.sign(error)
-            
-                expert_counts.zero_()
         
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
